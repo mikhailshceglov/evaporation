@@ -52,7 +52,7 @@ def parse_args(script_dir: Path) -> argparse.Namespace:
           out.csv
           noise_plots/
     """
-    default_in = script_dir.parent / "data.csv"
+    default_in = script_dir.parent / "data" / "data.csv"
     default_out = script_dir / "out.csv"
     default_plots = script_dir / "noise_plots"
 

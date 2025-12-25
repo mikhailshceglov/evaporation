@@ -15,7 +15,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IN_CSV = SCRIPT_DIR / "out.csv"          # rain/out.csv
 
 # Если out.csv ещё нет — можно показать просто сырые данные из ../data.csv
-FALLBACK_CSV = SCRIPT_DIR.parent / "data.csv"
+FALLBACK_CSV = SCRIPT_DIR.parent / "data" / "data.csv"
 
 OUT_HTML = SCRIPT_DIR / "interactive_plot.html"
 
