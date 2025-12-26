@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # ПАРАМЕТРЫ
-THRESHOLD_MM = 16.5         # порог резкого изменения (мм)
+THRESHOLD_MM = 0.7         # порог резкого изменения (мм)
 DAYS_PER_MONTH_PLOT = 3     # сколько первых дней месяца показывать
 
 TIME_COL = 'Дата/время'
