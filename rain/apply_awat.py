@@ -1,537 +1,662 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+apply_awat.py
+
+AWAT (Hess et al., 2014) pipeline:
+1) Read CSV (sep=';', decimal=',', utf-8-sig)
+2) Parse datetime column, sort
+3) Split by gaps (gap_minutes)
+4) For each point i:
+   - take window w_max (odd, clipped at edges)
+   - select polynomial degree k by AICc (k=0..poly_max_k, and k<=m-2)
+   - compute s_res,i and s_dat,i
+   - B_i = s_res,i / s_dat,i = sqrt(1 - R_i^2)
+   - adaptive window w_i = max(w_min, B_i*w_max) rounded to odd, clipped to [w_min, w_max]
+5) Adaptive moving average with w_i => tilde_y
+6) Thresholding with memory:
+      z_0 = tilde_y_0
+      z_i = z_{i-1} if |tilde_y_i - z_{i-1}| < delta_i else tilde_y_i
+   where delta_i = clip(s_res,i * t_{0.975, df}, delta_min, delta_max),
+   df = max(1, m - (k+1)) (residual dof in the fit window)
+7) noise_i = |y_i - z_i|
+8) Noise intervals: consecutive points with noise_i > noise_eps (broken by time gaps too),
+   length >= min_noise_len. Save one PNG per interval.
+
+Only: pandas, numpy, matplotlib, scipy
+"""
+
 from __future__ import annotations
 
 import argparse
+import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import AutoMinorLocator, MultipleLocator
-
-# SciPy optional
-try:
-    from scipy.stats import t as student_t  # type: ignore
-
-    def t_crit_975(df: int) -> float:
-        df = int(max(df, 1))
-        return float(student_t.ppf(0.975, df))
-except Exception:
-    def t_crit_975(df: int) -> float:
-        return 1.959963984540054
+from scipy.stats import t as student_t
 
 
-EPS = 1e-12
-
-
-def make_odd(n: int) -> int:
+# -----------------------------
+# Helpers
+# -----------------------------
+def _oddify(n: int) -> int:
     n = int(n)
     if n < 1:
-        return 1
-    return n if (n % 2 == 1) else (n + 1)
+        n = 1
+    if n % 2 == 0:
+        n += 1
+    return n
 
 
-def clip(x: float, lo: float, hi: float) -> float:
+def _clip(x: float, lo: float, hi: float) -> float:
     return float(min(max(x, lo), hi))
 
 
-def parse_args(script_dir: Path) -> argparse.Namespace:
-    """
-    Defaults tied to project structure:
-      project/
-        data.csv
-        rain/
-          apply_awat.py
-          out.csv
-          noise_plots/
-    """
-    default_in = script_dir.parent / "data" / "data.csv"
-    default_out = script_dir / "out.csv"
-    default_plots = script_dir / "noise_plots"
-
-    ap = argparse.ArgumentParser(description="Apply AWAT filter to time series in data.csv")
-    ap.add_argument("--in", dest="in_path", default=str(default_in),
-                    help="Input CSV (default: ../data.csv relative to script)")
-    ap.add_argument("--out", dest="out_path", default=str(default_out),
-                    help="Output CSV (default: rain/out.csv)")
-    ap.add_argument("--plots-dir", dest="plots_dir", default=str(default_plots),
-                    help="Dir for noise interval PNGs (default: rain/noise_plots)")
-    ap.add_argument("--w-max", type=int, default=31, help="Maximum window width (odd number of points)")
-    ap.add_argument("--w-min", type=int, default=5, help="Minimum window width (odd number of points)")
-    ap.add_argument("--delta-min", type=float, default=0.081, help="Minimum threshold delta (mm)")
-    ap.add_argument("--delta-max", type=float, default=0.24, help="Maximum threshold delta (mm)")
-    ap.add_argument("--poly-max-k", type=int, default=6, help="Maximum polynomial degree for AICc search")
-    ap.add_argument("--noise-eps", type=float, required=True, help="Noise threshold in mm for |y-z|")
-    ap.add_argument("--min-noise-len", type=int, default=3, help="Min interval length (points) to save plot")
-    ap.add_argument("--gap-minutes", type=float, default=10.0,
-                    help="If time gap between consecutive points > this, split segments (minutes)")
-    ap.add_argument("--y-col", type=str, default=None,
-                    help="Optional: explicitly set y column name (otherwise auto-detect)")
-    ap.add_argument("--max-xticks", type=int, default=10,
-                    help="Max number of X tick labels on interval plots (picked from existing datapoints)")
-    return ap.parse_args()
+def _safe_float(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
 
 
-def resolve_path(p: str, script_dir: Path) -> Path:
+def _pick_tick_indices(n: int, max_ticks: int = 8) -> np.ndarray:
     """
-    If user passes relative path -> resolve relative to *current working dir*.
-    If user passes something like ../data.csv while running from root, it still works.
-    For defaults we already pass absolute-ish strings; still normalize here.
+    Return indices for x-axis ticks. Ensures ticks correspond to actual data points.
     """
-    return Path(p).expanduser().resolve()
+    if n <= 0:
+        return np.array([], dtype=int)
+    if n <= max_ticks:
+        return np.arange(n, dtype=int)
+    # include first & last
+    idx = np.linspace(0, n - 1, num=max_ticks, dtype=int)
+    idx = np.unique(idx)
+    if idx[0] != 0:
+        idx = np.r_[0, idx]
+    if idx[-1] != n - 1:
+        idx = np.r_[idx, n - 1]
+    idx = np.unique(idx)
+    return idx.astype(int)
 
 
-def choose_y_column(df: pd.DataFrame, dt_col: str, y_col_arg: Optional[str] = None) -> str:
-    """
-    Auto-pick y column.
-    Priority: columns with 'уровень' (and 'мм' if present), then by numeric count.
-    """
-    if y_col_arg is not None:
-        if y_col_arg not in df.columns:
-            raise ValueError(f"--y-col '{y_col_arg}' not found in columns: {list(df.columns)}")
-        return y_col_arg
+def _fmt_dt(dt: pd.Timestamp) -> str:
+    # stable filename-safe-ish
+    return dt.strftime("%Y%m%d_%H%M%S")
 
+
+def _sanitize_filename(s: str) -> str:
+    s = re.sub(r"[^\w\-.]+", "_", s, flags=re.UNICODE)
+    return s.strip("_")
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def _auto_detect_y_column(df: pd.DataFrame, dt_col: str) -> str:
+    """
+    Heuristic y auto-selection for various schemas.
+    Prefers:
+      - "level_cleaned" / "level" / "уровень" / "мм"
+    Penalizes:
+      - temperature, voltage, battery
+    """
     best_col = None
-    best_score = -1
+    best_score = -1e18
 
     for c in df.columns:
         if c == dt_col:
             continue
 
-        s_num = pd.to_numeric(df[c], errors="coerce")
-        count_num = int(s_num.notna().sum())
-        if count_num == 0:
+        s = pd.to_numeric(df[c], errors="coerce")
+        cnt = int(s.notna().sum())
+        if cnt == 0:
             continue
 
         name = str(c).strip().lower()
-        score = count_num
 
-        # strong preference for water level columns
+        score = float(cnt)
+        # strong preferences
+        if "level_cleaned" in name:
+            score += 2_000_000
+        if "level" in name:
+            score += 800_000
         if "уров" in name or "уровень" in name:
-            score += 1_000_000
+            score += 800_000
         if "мм" in name:
             score += 200_000
-        if "level" in name:
-            score += 500_000
-        if "water" in name:
-            score += 200_000
 
-        # slight penalty for obvious non-level columns
+        # penalize non-level columns
         if "температ" in name or "temp" in name:
-            score -= 100_000
-        if "напряж" in name or "акб" in name or "volt" in name:
-            score -= 100_000
+            score -= 300_000
+        if "напряж" in name or "акб" in name or "volt" in name or "battery" in name:
+            score -= 300_000
+
+        # prefer smoother signal: smaller median abs diff (only if enough points)
+        if cnt >= 50:
+            vals = s.dropna().to_numpy(dtype=float)
+            d = np.abs(np.diff(vals))
+            if d.size > 0:
+                score -= float(np.median(d)) * 1_000  # weak tie-breaker
 
         if score > best_score:
             best_score = score
             best_col = c
 
     if best_col is None:
-        raise ValueError("Could not auto-detect y column. Provide --y-col.")
+        raise ValueError("Cannot auto-detect y column. Use --y-col explicitly.")
     return str(best_col)
 
 
-def split_by_gap_minutes(times: np.ndarray, gap_minutes: float) -> List[Tuple[int, int]]:
-    n = len(times)
-    if n == 0:
-        return []
-    if n == 1:
-        return [(0, 0)]
-    gaps = (times[1:] - times[:-1]) / np.timedelta64(1, "m")
-    breaks = np.where(gaps > gap_minutes)[0]
-    segs = []
-    start = 0
-    for b in breaks:
-        end = int(b)
-        segs.append((start, end))
-        start = int(b + 1)
-    segs.append((start, n - 1))
-    return segs
-
-
-def window_bounds_centered(i: int, n: int, w: int) -> Tuple[int, int, int]:
-    w = make_odd(int(w))
-    if n <= w:
-        l, r = 0, n - 1
-        rlen = r - l + 1
-        if rlen % 2 == 0 and rlen > 1:
-            r -= 1
-            rlen -= 1
-        return l, r, rlen
-
-    half = w // 2
-    l = i - half
-    r = i + half
-    if l < 0:
-        r += -l
-        l = 0
-    if r >= n:
-        shift = r - (n - 1)
-        l -= shift
-        r = n - 1
-        if l < 0:
-            l = 0
-    rlen = r - l + 1
-    return int(l), int(r), int(rlen)
-
-
 @dataclass
-class FitStats:
+class FitResult:
+    k: int
     s_res: float
     s_dat: float
     B: float
     delta: float
-    w_i: int
 
 
-def polyfit_aicc_stats(
-    times: np.ndarray,
+class PolyFitCache:
+    """
+    Cache for (m,k) -> (x, V, pinv(V)) where
+      x: length m
+      V: Vandermonde with columns x^0..x^k (increasing=True), shape (m, k+1)
+      pinv: shape (k+1, m)
+    Works for both odd and even m (edges may produce even windows).
+    """
+    def __init__(self):
+        self._cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def get(self, m: int, k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        m = int(m)
+        k = int(k)
+        key = (m, k)
+        if key in self._cache:
+            return self._cache[key]
+
+        # FIX: x must be length exactly m even when m is even
+        # center around 0; for even m we get half-step centered grid
+        x = np.arange(m, dtype=float) - (m - 1) / 2.0  # length m
+
+        V = np.vander(x, N=k + 1, increasing=True)      # (m, k+1)
+        pinv = np.linalg.pinv(V)                        # (k+1, m)
+
+        self._cache[key] = (x, V, pinv)
+        return x, V, pinv
+
+def _aicc(rss: float, n: int, p: int) -> float:
+    """
+    AICc for least squares:
+      AIC = n * ln(RSS/n) + 2p
+      AICc = AIC + 2p(p+1)/(n-p-1)
+    """
+    n = int(n)
+    p = int(p)
+    if n <= 0:
+        return float("inf")
+    if rss <= 0:
+        # perfect fit
+        return -1e30
+    if n - p - 1 <= 0:
+        return float("inf")
+    aic = n * math.log(rss / n) + 2 * p
+    aicc = aic + (2 * p * (p + 1)) / (n - p - 1)
+    return float(aicc)
+
+def _fit_window(
+    y_win: np.ndarray,
+    m: int,
+    w_max: int,
+    poly_max_k: int,
+    delta_min: float,
+    delta_max: float,
+    cache: PolyFitCache,
+) -> FitResult:
+    y_win = np.asarray(y_win, dtype=float)
+    m = int(len(y_win))  # FIX: trust actual window length
+    if m < 3:
+        # too short: fallback
+        s_dat = float(np.std(y_win, ddof=1)) if m >= 2 else 0.0
+        s_res = 0.0
+        B = 0.0
+        delta = _clip(0.0, delta_min, delta_max)
+        return FitResult(k=0, s_res=s_res, s_dat=s_dat, B=B, delta=delta)
+
+    s_dat = float(np.std(y_win, ddof=1))
+    if not np.isfinite(s_dat) or s_dat <= 0:
+        s_dat = 0.0
+
+    # bounds for k: need m - (k+1) >= 1 and AICc denom n-p-1 positive => m-(k+1)-1 >0 => m-k-2>0 => k<=m-3
+    k_max = min(int(poly_max_k), m - 3)
+    if k_max < 0:
+        k_max = 0
+
+    best_k = 0
+    best_aicc = float("inf")
+    best_rss = float("inf")
+    best_p = 1
+    best_yhat = None
+
+    for k in range(0, k_max + 1):
+        _, V, pinv = cache.get(m, k)
+        coeff = pinv @ y_win
+        y_hat = V @ coeff
+        resid = y_win - y_hat
+        rss = float(np.sum(resid * resid))
+        p = k + 1
+        aicc = _aicc(rss=rss, n=m, p=p)
+        if aicc < best_aicc:
+            best_aicc = aicc
+            best_k = k
+            best_rss = rss
+            best_p = p
+            best_yhat = y_hat
+
+    if best_yhat is None:
+        best_yhat = np.full_like(y_win, float(np.mean(y_win)))
+        best_rss = float(np.sum((y_win - best_yhat) ** 2))
+        best_k = 0
+        best_p = 1
+
+    # residual std with dof correction
+    dof = max(1, m - best_p)
+    s_res = math.sqrt(best_rss / dof) if best_rss >= 0 else 0.0
+
+    # R^2
+    y_mean = float(np.mean(y_win))
+    sst = float(np.sum((y_win - y_mean) ** 2))
+    if sst <= 0:
+        r2 = 1.0
+    else:
+        r2 = 1.0 - (best_rss / sst)
+        r2 = float(np.clip(r2, -1.0, 1.0))
+
+    # B = sqrt(1 - R^2) (>=0)
+    B = math.sqrt(max(0.0, 1.0 - r2))
+
+    # delta_i = clip(s_res * t_{0.975, dof}, delta_min, delta_max)
+    tcrit = float(student_t.ppf(0.975, df=dof)) if dof > 0 else 1.96
+    delta = _clip(s_res * tcrit, delta_min, delta_max)
+
+    return FitResult(k=best_k, s_res=float(s_res), s_dat=float(s_dat), B=float(B), delta=float(delta))
+
+
+def _compute_segment_awat(
+    dt: np.ndarray,
     y: np.ndarray,
-    i: int,
     w_max: int,
     w_min: int,
     delta_min: float,
     delta_max: float,
-    k_max: int,
-) -> FitStats:
+    poly_max_k: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute z, s_res, B, w_i, delta for one continuous segment (no large time gaps inside).
+    """
     n = len(y)
-    w_max = make_odd(w_max)
-    w_min = make_odd(w_min)
+    y = np.asarray(y, dtype=float)
+
+    w_max = _oddify(w_max)
+    w_min = _oddify(w_min)
     w_min = min(w_min, w_max)
 
-    l, r, rlen = window_bounds_centered(i, n, w_max)
-    ywin = y[l:r + 1]
-    twin = times[l:r + 1]
+    cache = PolyFitCache()
 
-    x = (twin - times[i]) / np.timedelta64(1, "m")
-    x = x.astype(np.float64)
+    s_res = np.full(n, np.nan, dtype=float)
+    B = np.full(n, np.nan, dtype=float)
+    w_i = np.full(n, w_min, dtype=int)
+    delta_i = np.full(n, np.nan, dtype=float)
 
-    if rlen < 3:
-        s_res = 0.0
-        ymean = float(np.mean(ywin)) if rlen > 0 else 0.0
-        s_dat = float(np.sqrt(np.mean((ywin - ymean) ** 2))) if rlen > 0 else 0.0
-        B = 1.0 if s_dat < EPS else float(min(max(s_res / s_dat, 0.0), 1.0))
-        w_i = make_odd(max(w_min, int(round(B * w_max))))
-        w_i = min(w_i, rlen if (rlen % 2 == 1) else max(rlen - 1, 1))
-        delta = clip(s_res * t_crit_975(1), delta_min, delta_max)
-        return FitStats(s_res=s_res, s_dat=s_dat, B=B, delta=delta, w_i=w_i)
-
-    ymean = float(np.mean(ywin))
-    s_dat = float(np.sqrt(np.mean((ywin - ymean) ** 2)))
-
-    best_aicc = float("inf")
-    best_k = 0
-    best_ssq = None
-
-    for k in range(0, int(k_max) + 1):
-        nparams = k + 1
-        if (rlen - nparams - 1) <= 0:
-            continue
-        try:
-            coeff = np.polyfit(x, ywin, deg=k)
-            yhat = np.polyval(coeff, x)
-            resid = ywin - yhat
-            ssq = float(np.sum(resid ** 2))
-        except Exception:
-            continue
-
-        ssq_per = max(ssq / rlen, EPS)
-        aicc = (rlen * np.log(ssq_per)) + (2.0 * nparams) + (2.0 * nparams * (nparams + 1) / (rlen - nparams - 1))
-        if aicc < best_aicc:
-            best_aicc = aicc
-            best_k = k
-            best_ssq = ssq
-
-    if best_ssq is None:
-        resid = ywin - ymean
-        best_ssq = float(np.sum(resid ** 2))
-        best_k = 0
-
-    s_res = float(np.sqrt(best_ssq / rlen))
-
-    if s_dat < EPS:
-        B = 1.0
-    else:
-        B = float(s_res / s_dat)
-    B = float(min(max(B, 0.0), 1.0))
-
-    raw_w = max(float(w_min), float(B) * float(w_max))
-    w_i = make_odd(int(round(raw_w)))
-    w_i = min(w_i, w_max)
-    max_odd_len = rlen if (rlen % 2 == 1) else max(rlen - 1, 1)
-    w_i = min(w_i, max_odd_len)
-    w_i = max(w_i, 1)
-
-    df = int(max(rlen - (best_k + 1), 1))
-    delta = clip(s_res * t_crit_975(df), delta_min, delta_max)
-
-    return FitStats(s_res=s_res, s_dat=s_dat, B=B, delta=delta, w_i=w_i)
-
-
-def moving_average_variable_window(y: np.ndarray, w_vec: np.ndarray) -> np.ndarray:
-    n = len(y)
-    y = y.astype(np.float64)
-    csum = np.concatenate([[0.0], np.cumsum(y)])
-    out = np.empty(n, dtype=np.float64)
+    # 1) local fits (AICc -> k, s_res, B, delta) on window w_max
     for i in range(n):
-        w = make_odd(int(w_vec[i]))
-        half = w // 2
-        l = max(0, i - half)
-        r = min(n - 1, i + half)
-        out[i] = (csum[r + 1] - csum[l]) / float(r - l + 1)
-    return out
+        h = w_max // 2
+        l = max(0, i - h)
+        r = min(n - 1, i + h)
+        # ensure odd length by trimming if needed
+        m = r - l + 1
+        if m % 2 == 0:
+            if r < n - 1:
+                r += 1
+            elif l > 0:
+                l -= 1
+            m = r - l + 1
+        y_win = y[l:r + 1]
+        res = _fit_window(
+            y_win=y_win,
+            m=m,
+            w_max=w_max,
+            poly_max_k=poly_max_k,
+            delta_min=delta_min,
+            delta_max=delta_max,
+            cache=cache,
+        )
+        s_res[i] = res.s_res
+        B[i] = res.B
+        delta_i[i] = res.delta
 
-
-def threshold_with_memory(tilde_y: np.ndarray, delta: np.ndarray) -> np.ndarray:
-    n = len(tilde_y)
-    z = np.empty(n, dtype=np.float64)
-    if n == 0:
-        return z
-    z[0] = float(tilde_y[0])
-    for i in range(1, n):
-        if abs(float(tilde_y[i]) - float(z[i - 1])) < float(delta[i]):
-            z[i] = z[i - 1]
+        # w_i = max(w_min, B_i * w_max) rounded to odd, clipped
+        if np.isfinite(res.B):
+            w_val = res.B * w_max
         else:
-            z[i] = float(tilde_y[i])
-    return z
+            w_val = float(w_min)
+        w_use = int(round(w_val))
+        w_use = _oddify(w_use)
+        w_use = max(w_min, min(w_use, w_max))
+        w_i[i] = w_use
+
+    # 2) adaptive moving average using w_i => tilde_y
+    prefix = np.cumsum(np.r_[0.0, y])  # len n+1
+    tilde = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        h = int(w_i[i]) // 2
+        l = max(0, i - h)
+        r = min(n - 1, i + h)
+        s = prefix[r + 1] - prefix[l]
+        tilde[i] = s / (r - l + 1)
+
+    # 3) thresholding with memory => z
+    z = np.full(n, np.nan, dtype=float)
+    z[0] = tilde[0]
+    for i in range(1, n):
+        prev = z[i - 1]
+        if not np.isfinite(prev):
+            prev = tilde[i - 1]
+        if abs(tilde[i] - prev) < float(delta_i[i]):
+            z[i] = prev
+        else:
+            z[i] = tilde[i]
+
+    return z, s_res, B, w_i.astype(int), delta_i
 
 
-def ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-
-def _pick_tick_indices(n: int, max_ticks: int) -> np.ndarray:
-    if n <= 0:
-        return np.array([], dtype=int)
-    max_ticks = max(2, int(max_ticks))
-    if n <= max_ticks:
-        return np.arange(n, dtype=int)
-    idx = np.linspace(0, n - 1, num=max_ticks, dtype=int)
-    idx = np.unique(idx)
-    if idx[0] != 0:
-        idx = np.insert(idx, 0, 0)
-    if idx[-1] != n - 1:
-        idx = np.append(idx, n - 1)
-    return np.unique(idx)
-
-
-def plot_noise_interval(
-    out_path: Path,
-    dt: np.ndarray,  # datetime64[ns]
-    y: np.ndarray,
-    z: np.ndarray,
-    interval_id: int,
-    max_xticks: int,
-) -> None:
-    start_t = pd.to_datetime(dt[0]).to_pydatetime()
-    end_t = pd.to_datetime(dt[-1]).to_pydatetime()
-
-    n = len(dt)
-    x = np.arange(n, dtype=int)  # x-axis = indices only
-
-    plt.figure(figsize=(12, 4))
-    plt.plot(x, y, label="y (raw)")
-    plt.plot(x, z, label="z (AWAT)")
-
-    plt.title(f"Noise interval #{interval_id:03d}: {start_t} — {end_t}")
-    plt.xlabel("Время (метки строго из данных)")
-    plt.ylabel("y")
-
-    # X ticks: ONLY from existing datapoints
-    tick_idx = _pick_tick_indices(n, max_ticks=max_xticks)
-    tick_labels = [pd.to_datetime(dt[i]).strftime("%Y-%m-%d %H:%M:%S") for i in tick_idx]
-    plt.xticks(tick_idx, tick_labels, rotation=30, ha="right")
-
-    # "клетчатый" график
-    ax = plt.gca()
-    ax.set_axisbelow(True)
-    ax.grid(True, which="major", linestyle="-", linewidth=0.6, alpha=0.7)
-    ax.minorticks_on()
-
-    if n <= 200:
-        ax.xaxis.set_minor_locator(MultipleLocator(1))
-    else:
-        step = max(1, n // 50)
-        ax.xaxis.set_minor_locator(MultipleLocator(step))
-    ax.yaxis.set_minor_locator(AutoMinorLocator())
-    ax.grid(True, which="minor", linestyle=":", linewidth=0.5, alpha=0.5)
-
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-
-def main() -> None:
-    script_dir = Path(__file__).resolve().parent
-    args = parse_args(script_dir)
-
-    w_max = make_odd(args.w_max)
-    w_min = make_odd(args.w_min)
-    if w_min > w_max:
-        w_min = w_max
-    if args.delta_min > args.delta_max:
-        raise ValueError("--delta-min must be <= --delta-max")
-
-    in_path = resolve_path(args.in_path, script_dir)
-    out_path = resolve_path(args.out_path, script_dir)
-    plots_dir = resolve_path(args.plots_dir, script_dir)
-    ensure_dir(plots_dir)
-    ensure_dir(out_path.parent)
-
-    df = pd.read_csv(in_path, sep=";", decimal=",", encoding="utf-8-sig")
-
-    dt_col = "Дата/время"
-    if dt_col not in df.columns:
-        raise ValueError(f"Column '{dt_col}' not found. Columns: {list(df.columns)}")
-
-    df = df.copy()
-    df["datetime"] = pd.to_datetime(df[dt_col], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["datetime"])
-
-    y_col = choose_y_column(df, dt_col=dt_col, y_col_arg=args.y_col)
-    df["y"] = pd.to_numeric(df[y_col], errors="coerce")
-    df = df.dropna(subset=["y"])
-
-    df = df.sort_values("datetime").reset_index(drop=True)
-
-    times = df["datetime"].to_numpy(dtype="datetime64[ns]")
-    y_arr = df["y"].to_numpy(dtype=np.float64)
-    n = len(df)
+def _find_intervals(
+    dt: pd.Series,
+    mask: np.ndarray,
+    gap_minutes: float,
+    min_len: int,
+) -> List[Tuple[int, int]]:
+    """
+    Find consecutive True-intervals in mask, breaking at time gaps > gap_minutes.
+    """
+    n = len(mask)
     if n == 0:
-        raise ValueError("No valid rows after parsing datetime/y.")
+        return []
 
-    segments = split_by_gap_minutes(times, float(args.gap_minutes))
-
-    s_res = np.full(n, np.nan, dtype=np.float64)
-    B = np.full(n, np.nan, dtype=np.float64)
-    w_i = np.full(n, 1, dtype=np.int32)
-    delta_i = np.full(n, np.nan, dtype=np.float64)
-    z = np.full(n, np.nan, dtype=np.float64)
-
-    for (a, b) in segments:
-        seg_len = b - a + 1
-        if seg_len <= 0:
-            continue
-
-        t_seg = times[a:b + 1]
-        y_seg = y_arr[a:b + 1]
-
-        wmax_seg = min(w_max, seg_len if (seg_len % 2 == 1) else max(seg_len - 1, 1))
-        wmin_seg = min(w_min, wmax_seg)
-
-        if seg_len < 3 or wmax_seg < 3:
-            s_res[a:b + 1] = 0.0
-            B[a:b + 1] = 1.0
-            w_i[a:b + 1] = 1
-            delta_i[a:b + 1] = clip(0.0 * t_crit_975(1), args.delta_min, args.delta_max)
-            z[a:b + 1] = y_seg
-            continue
-
-        w_vec = np.empty(seg_len, dtype=np.int32)
-        delta_vec = np.empty(seg_len, dtype=np.float64)
-        sres_vec = np.empty(seg_len, dtype=np.float64)
-        B_vec = np.empty(seg_len, dtype=np.float64)
-
-        for j in range(seg_len):
-            stats = polyfit_aicc_stats(
-                times=t_seg,
-                y=y_seg,
-                i=j,
-                w_max=wmax_seg,
-                w_min=wmin_seg,
-                delta_min=float(args.delta_min),
-                delta_max=float(args.delta_max),
-                k_max=int(args.poly_max_k),
-            )
-            sres_vec[j] = stats.s_res
-            B_vec[j] = stats.B
-            delta_vec[j] = stats.delta
-            w_vec[j] = stats.w_i
-
-        tilde = moving_average_variable_window(y_seg, w_vec)
-        z_seg = threshold_with_memory(tilde, delta_vec)
-
-        s_res[a:b + 1] = sres_vec
-        B[a:b + 1] = B_vec
-        w_i[a:b + 1] = w_vec
-        delta_i[a:b + 1] = delta_vec
-        z[a:b + 1] = z_seg
-
-    noise_i = np.abs(y_arr - z)
-
-    out_df = pd.DataFrame({
-        "datetime": pd.to_datetime(times),
-        "y": y_arr,
-        "z": z,
-        "s_res": s_res,
-        "B": B,
-        "w_i": w_i.astype(int),
-        "delta_i": delta_i,
-        "noise_i": noise_i,
-    })
-    out_df.to_csv(out_path, sep=";", decimal=",", encoding="utf-8-sig", index=False)
-
-    # intervals: respect gap breaks
-    gap_break = np.zeros(n, dtype=bool)
+    dt64 = dt.to_numpy(dtype="datetime64[ns]")
+    gaps = np.zeros(n, dtype=bool)
     if n > 1:
-        gaps = (times[1:] - times[:-1]) / np.timedelta64(1, "m")
-        gap_break[1:] = gaps > float(args.gap_minutes)
-
-    mask = noise_i > float(args.noise_eps)
+        dmins = (dt64[1:] - dt64[:-1]) / np.timedelta64(1, "m")
+        gaps[1:] = dmins > float(gap_minutes)
 
     intervals: List[Tuple[int, int]] = []
-    start = None
+    start: Optional[int] = None
+
     for i in range(n):
-        if gap_break[i]:
+        if gaps[i]:
             if start is not None:
-                intervals.append((start, i - 1))
+                end = i - 1
+                if end - start + 1 >= int(min_len):
+                    intervals.append((start, end))
                 start = None
-        if mask[i]:
+
+        if bool(mask[i]):
             if start is None:
                 start = i
         else:
             if start is not None:
-                intervals.append((start, i - 1))
+                end = i - 1
+                if end - start + 1 >= int(min_len):
+                    intervals.append((start, end))
                 start = None
-    if start is not None:
-        intervals.append((start, n - 1))
 
-    saved = 0
-    for idx, (a, b) in enumerate(intervals, start=1):
-        if (b - a + 1) < int(args.min_noise_len):
+    if start is not None:
+        end = n - 1
+        if end - start + 1 >= int(min_len):
+            intervals.append((start, end))
+
+    return intervals
+
+
+def plot_noise_interval(
+    out_path: Path,
+    dt: pd.Series,
+    y: np.ndarray,
+    z: np.ndarray,
+    interval_id: int,
+    l: int,
+    r: int,
+    max_xticks: int = 8,
+) -> None:
+    """
+    Save one PNG per interval. X ticks are only at timestamps from data.
+    """
+    dt_seg = dt.iloc[l:r + 1].reset_index(drop=True)
+    y_seg = y[l:r + 1]
+    z_seg = z[l:r + 1]
+
+    n = len(y_seg)
+    if n <= 1:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 4), dpi=200)
+
+    ax.plot(dt_seg.to_numpy(), y_seg, linewidth=1.0, label="y (raw)")
+    ax.plot(dt_seg.to_numpy(), z_seg, linewidth=1.2, label="z (AWAT)")
+
+    ax.set_title(
+        f"Noise interval #{interval_id}: {dt_seg.iloc[0]} — {dt_seg.iloc[-1]}  (len={n})"
+    )
+    ax.set_xlabel("time")
+    ax.set_ylabel("level (mm)")
+
+    # grid (клетчатый)
+    ax.minorticks_on()
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.8)
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.4, alpha=0.6)
+
+    # X ticks: only from existing datetimes
+    tick_idx = _pick_tick_indices(n, max_ticks=max_xticks)
+    tick_pos = dt_seg.iloc[tick_idx].to_numpy()
+    tick_lbl = [pd.Timestamp(x).strftime("%Y-%m-%d\n%H:%M:%S") for x in dt_seg.iloc[tick_idx]]
+    ax.set_xticks(tick_pos)
+    ax.set_xticklabels(tick_lbl, rotation=0, ha="center")
+
+    ax.legend(loc="best")
+    fig.tight_layout()
+
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> None:
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+
+    # ====== CHANGED DEFAULTS: everything into script_dir/out/ ======
+    default_out_dir = script_dir / "out"
+    default_in = project_root / "data" / "data.csv"
+    default_out = default_out_dir / "out.csv"
+    default_plots = default_out_dir / "noise_plots"
+    # =============================================================
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--in", dest="in_path", default=str(default_in),
+                   help="Input CSV path (default: data/data.csv)")
+    p.add_argument("--out", dest="out_path", default=str(default_out),
+                   help="Output CSV path (default: rain/out/out.csv)")
+    p.add_argument("--plots-dir", dest="plots_dir", default=str(default_plots),
+                   help="Directory for noise interval PNGs (default: rain/out/noise_plots/)")
+
+    p.add_argument("--dt-col", dest="dt_col", default="Дата/время",
+                   help="Datetime column name (default: 'Дата/время'). For cleaned_data.csv use 'datetime'.")
+    p.add_argument("--y-col", dest="y_col", default=None,
+                   help="Target y column name. If not set, auto-detects.")
+
+    p.add_argument("--w-max", dest="w_max", type=int, default=31)
+    p.add_argument("--w-min", dest="w_min", type=int, default=5)
+    p.add_argument("--delta-min", dest="delta_min", type=float, default=0.017)
+    p.add_argument("--delta-max", dest="delta_max", type=float, default=0.08)
+    p.add_argument("--poly-max-k", dest="poly_max_k", type=int, default=5)
+
+    p.add_argument("--noise-eps", dest="noise_eps", type=float, required=True,
+                   help="Noise threshold in mm for interval detection: noise_i > noise_eps")
+    p.add_argument("--min-noise-len", dest="min_noise_len", type=int, default=15,
+                   help="Minimum interval length in points (default: 15)")
+    p.add_argument("--gap-minutes", dest="gap_minutes", type=float, default=10.0,
+                   help="Split series if time gap > this many minutes (default: 10)")
+
+    args = p.parse_args()
+
+    in_path = Path(args.in_path)
+    out_path = Path(args.out_path)
+    plots_dir = Path(args.plots_dir)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"Input not found: {in_path}")
+
+    _ensure_dir(out_path.parent)
+    _ensure_dir(plots_dir)
+
+    # read
+    df = pd.read_csv(in_path, sep=";", decimal=",", encoding="utf-8-sig")
+    dt_col = str(args.dt_col)
+    if dt_col not in df.columns:
+        raise ValueError(f"Column '{dt_col}' not found. Columns: {list(df.columns)}")
+
+    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+    df = df.dropna(subset=[dt_col]).sort_values(dt_col).reset_index(drop=True)
+    df = df.rename(columns={dt_col: "datetime"})
+
+    if args.y_col is not None:
+        y_col = str(args.y_col)
+        if y_col not in df.columns:
+            raise ValueError(f"Column '{y_col}' not found. Columns: {list(df.columns)}")
+    else:
+        y_col = _auto_detect_y_column(df, dt_col="datetime")
+
+    y = pd.to_numeric(df[y_col], errors="coerce")
+    df = df.assign(y=y).dropna(subset=["y"]).reset_index(drop=True)
+
+    # gap split
+    dt = df["datetime"]
+    dt64 = dt.to_numpy(dtype="datetime64[ns]")
+    n = len(df)
+
+    gap_break = np.zeros(n, dtype=bool)
+    if n > 1:
+        dmins = (dt64[1:] - dt64[:-1]) / np.timedelta64(1, "m")
+        gap_break[1:] = dmins > float(args.gap_minutes)
+
+    # Prepare outputs
+    z_all = np.full(n, np.nan, dtype=float)
+    s_res_all = np.full(n, np.nan, dtype=float)
+    B_all = np.full(n, np.nan, dtype=float)
+    w_i_all = np.full(n, np.nan, dtype=float)
+    delta_all = np.full(n, np.nan, dtype=float)
+
+    w_max = _oddify(args.w_max)
+    w_min = _oddify(args.w_min)
+    if w_min > w_max:
+        w_min = w_max
+
+    # Process each segment
+    seg_starts = [0]
+    for i in range(1, n):
+        if gap_break[i]:
+            seg_starts.append(i)
+    seg_starts.append(n)
+
+    for si in range(len(seg_starts) - 1):
+        s = seg_starts[si]
+        e = seg_starts[si + 1]
+        if e - s <= 0:
             continue
 
-        dt_seg = times[a:b + 1]
-        y_seg = y_arr[a:b + 1]
-        z_seg = z[a:b + 1]
+        y_seg = df["y"].iloc[s:e].to_numpy(dtype=float)
+        dt_seg = df["datetime"].iloc[s:e].to_numpy(dtype="datetime64[ns]")
 
-        start_t = pd.to_datetime(dt_seg[0]).to_pydatetime()
-        end_t = pd.to_datetime(dt_seg[-1]).to_pydatetime()
-        fname = f"noise_{idx:03d}_{start_t:%Y%m%d_%H%M%S}__{end_t:%Y%m%d_%H%M%S}.png"
-        plot_path = plots_dir / fname
+        if len(y_seg) < 3:
+            # trivial segment
+            z_all[s:e] = y_seg
+            s_res_all[s:e] = 0.0
+            B_all[s:e] = 0.0
+            w_i_all[s:e] = float(w_min)
+            delta_all[s:e] = _clip(0.0, args.delta_min, args.delta_max)
+            continue
 
+        z_seg, s_res_seg, B_seg, w_i_seg, delta_seg = _compute_segment_awat(
+            dt=dt_seg,
+            y=y_seg,
+            w_max=w_max,
+            w_min=w_min,
+            delta_min=float(args.delta_min),
+            delta_max=float(args.delta_max),
+            poly_max_k=int(args.poly_max_k),
+        )
+
+        z_all[s:e] = z_seg
+        s_res_all[s:e] = s_res_seg
+        B_all[s:e] = B_seg
+        w_i_all[s:e] = w_i_seg.astype(int)
+        delta_all[s:e] = delta_seg
+
+    noise_i = np.abs(df["y"].to_numpy(dtype=float) - z_all)
+
+    out_df = pd.DataFrame({
+        "datetime": df["datetime"],
+        "y": df["y"].to_numpy(dtype=float),
+        "z": z_all,
+        "s_res": s_res_all,
+        "B": B_all,
+        "w_i": w_i_all.astype(int, copy=False),
+        "delta_i": delta_all,
+        "noise_i": noise_i,
+    })
+
+    # Save out CSV
+    out_df.to_csv(out_path, index=False, sep=";", decimal=",", encoding="utf-8-sig")
+    print(f"[OK] Input: {in_path.resolve()}")
+    print(f"[OK] Saved CSV: {out_path.resolve()}")
+    print(f"[INFO] y column selected: {y_col}")
+
+    # Noise intervals & plots
+    noise_mask = np.isfinite(noise_i) & (noise_i > float(args.noise_eps))
+    intervals = _find_intervals(
+        dt=df["datetime"],
+        mask=noise_mask,
+        gap_minutes=float(args.gap_minutes),
+        min_len=int(args.min_noise_len),
+    )
+
+    # Plot each interval
+    saved = 0
+    for idx, (l, r) in enumerate(intervals, start=1):
+        t0 = df["datetime"].iloc[l]
+        t1 = df["datetime"].iloc[r]
+        fname = _sanitize_filename(f"noise_{idx:04d}_{_fmt_dt(t0)}__{_fmt_dt(t1)}.png")
+        out_png = plots_dir / fname
         plot_noise_interval(
-            plot_path,
-            dt_seg,
-            y_seg,
-            z_seg,
+            out_path=out_png,
+            dt=df["datetime"],
+            y=out_df["y"].to_numpy(dtype=float),
+            z=out_df["z"].to_numpy(dtype=float),
             interval_id=idx,
-            max_xticks=int(args.max_xticks),
+            l=l,
+            r=r,
+            max_xticks=8,
         )
         saved += 1
 
-    print(f"[OK] Input: {in_path}")
-    print(f"[OK] Saved CSV: {out_path}")
-    print(f"[OK] Saved noise plots: {saved} files in {plots_dir}/")
-    print(f"[INFO] y column selected: {y_col}")
+    print(f"[OK] Saved noise plots: {saved} files in {plots_dir.resolve()}")
 
 
 if __name__ == "__main__":
