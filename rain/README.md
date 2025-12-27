@@ -30,13 +30,10 @@ python3 rain/apply_awat.py \
   --in data/cleaned_data.csv \
   --dt-col datetime \
   --y-col level_cleaned_mm \
-  --out rain/out/out_cleaned.csv \
-  --plots-dir rain/out/noise_plots_cleaned \
-  --w-max 31 --w-min 5 \
-  --delta-min 0.017 --delta-max 0.08 \
   --noise-eps 0.086 \
   --min-noise-len 15 \
   --gap-minutes 10
+
 ```
 
 Результаты:
@@ -54,13 +51,9 @@ python3 rain/apply_awat.py \
 * гейт/вмешательство (`gate_mask`) — полупрозрачные прямоугольники
 
 ```bash
-python3 rain/interactive_plot.py \
-  --in rain/out/out_cleaned.csv \
-  --out-html rain/out/interactive_plot.html \
-  --dt-col datetime \
-  --y-col y
-
+python3 rain/interactive_plot.py
 xdg-open rain/out/interactive_plot.html
+
 ```
 
 ---
@@ -76,14 +69,13 @@ xdg-open rain/out/interactive_plot.html
 
 ```bash
 python3 rain/remove_rain.py \
-  --in rain/out/out_cleaned.csv \
+  --in rain/out/out.csv \
   --out rain/out/evap_only.csv \
   --out-html rain/out/evap_only.html \
   --dt-col datetime \
-  --y-col y \
-  --gap-minutes 10
-
+  --y-col y
 xdg-open rain/out/evap_only.html
+
 ```
 
 Итоги:
