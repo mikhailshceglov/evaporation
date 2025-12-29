@@ -422,6 +422,87 @@ def _fix_upward_steps_across_gaps(
 # =========================
 # Main removal: counterfactual + shift
 # =========================
+
+def _find_left_clean(event_mask: np.ndarray, seg_l: int, i: int) -> int | None:
+    j = i
+    while j >= seg_l and bool(event_mask[j]):
+        j -= 1
+    return j if j >= seg_l else None
+
+
+def _find_right_clean(event_mask: np.ndarray, seg_r: int, i: int) -> int | None:
+    j = i
+    while j <= seg_r and bool(event_mask[j]):
+        j += 1
+    return j if j <= seg_r else None
+
+
+def _bridge_events_linear(
+    t_min: np.ndarray,
+    y_obs: np.ndarray,
+    event_mask: np.ndarray,
+    br: np.ndarray,
+) -> np.ndarray:
+    """
+    Заполняет интервалы event_mask линейной интерполяцией между ближайшими
+    чистыми точками слева/справа (endpoint anchoring).
+
+    - непрерывность гарантирована: y_final[l-1] == y_obs[l-1], y_final[r+1] == y_obs[r+1]
+    - использует future (правый якорь)
+    - разрывы по времени (br=True) не склеиваем
+    """
+    n = len(y_obs)
+    y_final = y_obs.copy()
+
+    # интервалы непрерывности по времени
+    segs = _contiguous_time_segments(br)
+
+    for seg_l, seg_r in segs:
+        if seg_r - seg_l < 2:
+            continue
+
+        # интервалы событий внутри сегмента
+        ev_segs = _segments_from_mask(event_mask[seg_l:seg_r + 1], br[seg_l:seg_r + 1], 1)
+        ev_segs = [(seg_l + l, seg_l + r) for (l, r) in ev_segs]
+
+        for l, r in ev_segs:
+            # ищем якоря
+            iL = _find_left_clean(event_mask, seg_l, l - 1)
+            iR = _find_right_clean(event_mask, seg_r, r + 1)
+
+            if iL is None and iR is None:
+                # вообще нет опор — оставим как есть
+                continue
+
+            if iL is None:
+                # нет левого якоря: держим константу от правого
+                y_final[l:r + 1] = y_final[iR]
+                continue
+
+            if iR is None:
+                # нет правого якоря: держим константу от левого
+                y_final[l:r + 1] = y_final[iL]
+                continue
+
+            # оба якоря есть → линейный мост по времени
+            tL = float(t_min[iL])
+            tR = float(t_min[iR])
+            yL = float(y_final[iL])
+            yR = float(y_final[iR])
+
+            if not (np.isfinite(tL) and np.isfinite(tR) and np.isfinite(yL) and np.isfinite(yR)) or tR <= tL:
+                # fallback по индексу
+                y_final[l:r + 1] = np.linspace(yL, yR, num=(r - l + 1))
+                continue
+
+            tt = t_min[l:r + 1].astype(float)
+            alpha = (tt - tL) / (tR - tL)
+            alpha = np.clip(alpha, 0.0, 1.0)
+            y_final[l:r + 1] = yL + alpha * (yR - yL)
+
+    return y_final
+
+
 def remove_events_counterfactual(
     df: pd.DataFrame,
     dt_col: str,
@@ -433,6 +514,7 @@ def remove_events_counterfactual(
     event_tail_minutes: float,
     min_shift_gate: float,
     use_gate: bool,
+    bridge_events: bool,
 ) -> pd.DataFrame:
     dt = df[dt_col]
     y_obs = pd.to_numeric(df[y_col], errors="coerce").to_numpy(float)
@@ -450,6 +532,34 @@ def remove_events_counterfactual(
 
     t0 = dt.iloc[0]
     t_min = (dt - t0).dt.total_seconds().to_numpy(float) / 60.0
+
+        # ---------------------------------------------------------
+    # ВАРИАНТ A: endpoint anchoring (мост по краям события)
+    # ---------------------------------------------------------
+    if bridge_events:
+        y_final = _bridge_events_linear(
+            t_min=t_min,
+            y_obs=y_obs,
+            event_mask=event_mask,
+            br=br,
+        )
+
+        out = df.copy()
+        out["y_obs"] = y_obs
+        out["y_final_raw"] = y_final  # дальше существующие step-fix применятся как обычно
+
+        out["rain_mask"] = rain_mask.astype(int)
+        out["gate_mask"] = gate_mask.astype(int)
+        out["event_mask"] = event_mask.astype(int)
+        out["anom"] = np.asarray(anom, float)
+
+        # эти поля в режиме моста не имеют смысла — заполним нулями/NaN
+        out["event_offset_cum"] = 0.0
+        out["event_slope_mm_per_min"] = np.nan
+        out["event_offset_add_mm"] = 0.0
+
+        return out
+    
 
     fit_pts  = max(8, int(np.ceil((fit_hours_pre * 3600.0) / dt_step_sec)))
     post_pts = max(8, int(np.ceil((post_hours_off * 3600.0) / dt_step_sec)))
@@ -627,6 +737,10 @@ def main():
     ap.add_argument("--gap-step-fix-eps", type=float, default=GAP_STEP_FIX_EPS_MM)
     ap.add_argument("--gap-step-fix-win-min", type=float, default=GAP_STEP_FIX_WIN_MIN)
 
+    ap.add_argument("--bridge-events", action="store_true",
+                help="Fill event intervals by linear bridge between nearest clean points (uses future points, makes series continuous).")
+
+
     args = ap.parse_args()
 
     df = pd.read_csv(Path(args.in_csv), sep=";", decimal=",", encoding="utf-8-sig")
@@ -656,6 +770,7 @@ def main():
         event_tail_minutes=float(args.event_tail_minutes),
         min_shift_gate=float(args.min_shift_gate),
         use_gate=not args.no_gate,
+        bridge_events=bool(args.bridge_events),
     )
 
     out2 = out.copy()
