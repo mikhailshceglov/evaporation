@@ -3,18 +3,14 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# =============================
 # ПАРАМЕТРЫ
-# =============================
-THRESHOLD_MM = 1.5          # порог резкого изменения (мм)
+THRESHOLD_MM = 0.7         # порог резкого изменения (мм)
 DAYS_PER_MONTH_PLOT = 3     # сколько первых дней месяца показывать
 
 TIME_COL = 'Дата/время'
 LEVEL_COL = 'Уровень воды, мм'
 
-# =============================
 # АРГУМЕНТ
-# =============================
 if len(sys.argv) < 2:
     raise ValueError("Запуск: python data_cleaner.py input.xlsx")
 
@@ -26,9 +22,7 @@ PLOTS_DIR = 'plots'
 
 os.makedirs(PLOTS_DIR, exist_ok=True)
 
-# =============================
 # ЗАГРУЗКА ДАННЫХ
-# =============================
 df = pd.read_excel(INPUT_FILE)
 
 # Преобразуем дату в datetime
@@ -49,14 +43,10 @@ df['level_mm'] = (
     .astype(float)
 )
 
-# =============================
 # РАЗНОСТИ (вычисление изменений)
-# =============================
 df['delta'] = df['level_mm'].diff()
 
-# =============================
 # КОРРЕКЦИЯ ПРИЛИВОВ / ОТЛИВОВ
-# =============================
 df['level_cleaned'] = df['level_mm'].copy()
 used = set()
 
@@ -83,9 +73,10 @@ for i in range(1, len(df) - 1):
     d_event = abs(df.loc[j, 'level_mm'] - df.loc[j - 1, 'level_mm'])
     d_prev = abs(df.loc[j - 1, 'level_mm'] - df.loc[j - 2, 'level_mm'])
     
-    if d_event > 2 * d_prev:
+    if d_event > 2 * d_prev and j not in used:
         start = j
-        st_p.add(j)
+    
+    st_p.add(start)
 
     # расширение вправо
     j = i + 1
@@ -103,20 +94,14 @@ for i in range(1, len(df) - 1):
     for k in range(start, end + 1):
         jump = df.loc[k, 'level_mm'] - df.loc[k - 1, 'level_mm']
         df.loc[k:, 'level_cleaned'] -= jump
-        df.loc[k, 'level_cleaned'] = df.loc[k - 1, 'level_cleaned']
         used.add(k)
-        #jump_points.add(k)  # Добавляем индексы точек скачка в множество
-    #df.loc[end:, 'level_cleaned'] -= jump
-# =============================
+
 # СОХРАНЕНИЕ EXCEL
-# =============================
 out = df[['datetime', 'level_mm', 'level_cleaned']]
 out.columns = ['datetime', 'level_raw_mm', 'level_cleaned_mm']
 out.to_excel(OUTPUT_DATA, index=False)
 
-# =============================
 # ОБЩИЙ ГРАФИК
-# =============================
 plt.figure(figsize=(14, 6))
 plt.plot(df['datetime'], df['level_mm'], color='red', linewidth=1.0, label='Исходный ряд')
 plt.plot(df['datetime'], df['level_cleaned'], color='black', linewidth=1.5, label='Скорректированный ряд')
@@ -134,9 +119,7 @@ plt.tight_layout()
 plt.savefig(OUTPUT_PLOT, dpi=300)
 plt.close()
 
-# =============================
 # ПОМЕСЯЧНЫЕ ГРАФИКИ
-# =============================
 df['year'] = df['datetime'].dt.year
 df['month'] = df['datetime'].dt.month
 
@@ -158,17 +141,17 @@ for (year, month), group in df.groupby(['year', 'month']):
     mid_s = sub[sub['datetime'].isin(df.loc[list(mid_p), 'datetime'])]
     end_s = sub[sub['datetime'].isin(df.loc[list(end_p), 'datetime'])]
     plt.scatter(st_s['datetime'], st_s['level_mm'], 
-                color='blue', marker='o', label='Точки скачка', zorder=5)
+                color='blue', marker='o', label='стартовые очки скачка', zorder=5)
     plt.scatter(st_s['datetime'], st_s['level_cleaned'], 
-                color='blue', marker='o', label='Точки скачка', zorder=5)
+                color='blue', marker='o', zorder=5)
     plt.scatter(mid_s['datetime'], mid_s['level_mm'], 
-                color='yellow', marker='o', label='Точки скачка', zorder=5)
+                color='yellow', marker='o', label='серединные точки скачка', zorder=5)
     plt.scatter(mid_s['datetime'], mid_s['level_cleaned'], 
-                color='yellow', marker='o', label='Точки скачка', zorder=5)
+                color='yellow', marker='o', zorder=5)
     plt.scatter(end_s['datetime'], end_s['level_mm'], 
-                color='green', marker='o', label='Точки скачка', zorder=5)
+                color='green', marker='o', label='конечные точки скачка', zorder=5)
     plt.scatter(end_s['datetime'], end_s['level_cleaned'], 
-                color='green', marker='o', label='Точки скачка', zorder=5)
+                color='green', marker='o', zorder=5)
 
     plt.xlabel('Дата и время')
     plt.ylabel('Уровень воды, мм')
@@ -181,10 +164,7 @@ for (year, month), group in df.groupby(['year', 'month']):
     plt.savefig(os.path.join(PLOTS_DIR, fname), dpi=300)
     plt.close()
 
-# =============================
 # ГОТОВО
-# =============================
-print("Готово:")
 print(f"Excel: {OUTPUT_DATA}")
 print(f"Общий график: {OUTPUT_PLOT}")
 print(f"Помесячные графики: {PLOTS_DIR}/")
