@@ -31,3 +31,13 @@ python3 Kalman_filter/interactive_result.py
 xdg-open result/after_kalman_evap.html
 
 echo "Готово. Интерактивный график фильтра Калмана открыт в браузере."
+
+echo "4) Расчёт испарения (часовое / полусуточное / суточное)"
+python3 calc_evaporation.py
+
+echo "5) Испарение с поправкой на температуру"
+python3 calc_evaporation_corrected.py
+
+echo "Результаты пунктов 4-5:"
+echo " - calc_result/                 → испарение без температуры"
+echo " - calc_result_with_temperature → испарение с поправкой"
