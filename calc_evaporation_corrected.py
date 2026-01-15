@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 # ПУТИ
@@ -111,7 +112,55 @@ for day in first_days:
     plt.xlabel("Час суток")
     plt.ylabel("Накопленное испарение, мм")
     plt.title(f"Внутрисуточный ход испарения — {day}")
-    plt.grid(True)
+    
+    # НАСТРОЙКА ОСЕЙ
+    # Ось X: деления каждый час (0, 1, 2, ..., 23)
+    plt.xticks(range(0, 24, 1))
+    
+    # Ось Y: деления каждые 0.5 мм
+    # Определяем диапазон данных
+    all_y_values = np.concatenate([evap_old.values, evap_new.values])
+    y_min = all_y_values.min()
+    y_max = all_y_values.max()
+    
+    # Если данные отсутствуют или некорректны
+    if np.isnan(y_min) or np.isnan(y_max):
+        y_min = -0.5
+        y_max = 0.5
+    
+    # Гарантируем минимальный диапазон
+    if y_max - y_min < 0.5:
+        y_center = (y_min + y_max) / 2
+        y_min = y_center - 0.5
+        y_max = y_center + 0.5
+    
+    # Создаем деления с шагом 0.5 мм
+    y_start = np.floor(y_min * 2) / 2
+    y_end = np.ceil(y_max * 2) / 2 + 0.5
+    
+    # Проверяем корректность диапазона
+    if y_start >= y_end:
+        y_start = -0.5
+        y_end = 0.5
+    
+    # Создаем деления
+    if y_end > y_start:  # Проверяем перед созданием arange
+        y_ticks = np.arange(y_start, y_end, 0.5)
+        plt.yticks(y_ticks)
+    else:
+        # Если что-то пошло не так, используем стандартные деления
+        pass  # Оставляем стандартные деления matplotlib
+    
+    # Выделяем ноль (y=0)
+    plt.axhline(y=0, color='black', linewidth=0.8, linestyle='-')
+    
+    # Подписываем ноль жирным
+    ax = plt.gca()
+    for tick in ax.yaxis.get_major_ticks():
+        if tick.get_loc() == 0:
+            tick.label1.set_fontweight('bold')
+    
+    plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
     plt.savefig(OUT_DIR / f"evap_diurnal_{day}.png")
